@@ -215,13 +215,17 @@ class ChatterboxTTS:
         cfg_weight=0.5,
         temperature=0.8,
         # cache optimization params
-        max_new_tokens=1000, 
+        max_new_tokens=1000,
         max_cache_len=1500, # Affects the T3 speed, hence important
         # t3 sampling params
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
         t3_params={},
+        # streaming params
+        stream_tokens_per_slice=None,  # Set to enable streaming (e.g., 200)
+        stream_remove_milliseconds_end=45,
+        stream_remove_milliseconds_start=25,
     ):
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
@@ -250,27 +254,17 @@ class ChatterboxTTS:
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
         with torch.inference_mode():
-            speech_tokens = self.t3.inference(
-                t3_cond=self.conds.t3,
-                text_tokens=text_tokens,
-                max_new_tokens=max_new_tokens,  # TODO: use the value in config
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-                max_cache_len=max_cache_len,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-                **t3_params,
-            )
+            # Determine streaming mode
+            stream_mode = stream_tokens_per_slice is not None
 
-            
-            def speech_to_wav(speech_tokens):
+
+            def speech_to_wav(speech_tokens, no_trim=False, trim_start_ms=0, trim_end_ms=0):
                 # Extract only the conditional batch.
                 speech_tokens = speech_tokens[0]
 
                 # TODO: output becomes 1D
                 speech_tokens = drop_invalid_tokens(speech_tokens)
-                
+
                 def drop_bad_tokens(tokens):
                     # Use torch.where instead of boolean indexing to avoid sync
                     mask = tokens < 6561
@@ -282,19 +276,68 @@ class ChatterboxTTS:
                     result = torch.masked_select(tokens, mask)
                     return result
 
-                # speech_tokens = speech_tokens[speech_tokens < 6561]
                 speech_tokens = drop_bad_tokens(speech_tokens)
-                import time
-                start = time.time()
+
                 wav, _ = self.s3gen.inference(
                     speech_tokens=speech_tokens,
                     ref_dict=self.conds.gen,
+                    no_trim=no_trim,
                 )
-                end = time.time()
-                print(f"S3Gen inference time: {end - start:.2f} seconds")
                 wav = wav.squeeze(0).detach().cpu().numpy()
+
+                # Apply trimming for streaming chunks
+                if trim_end_ms > 0:
+                    wav = wav[:-int(self.sr * trim_end_ms / 1000)]
+                if trim_start_ms > 0:
+                    wav = wav[int(self.sr * trim_start_ms / 1000):]
+
                 watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
                 return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
-            return speech_to_wav(speech_tokens)
+            # Streaming mode
+            if stream_mode:
+                t3_output = self.t3.inference(
+                    t3_cond=self.conds.t3,
+                    text_tokens=text_tokens,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    cfg_weight=cfg_weight,
+                    max_cache_len=max_cache_len,
+                    repetition_penalty=repetition_penalty,
+                    min_p=min_p,
+                    top_p=top_p,
+                    stream_every_n_tokens=stream_tokens_per_slice,
+                    **t3_params,
+                )
+
+                # Process each chunk of tokens
+                for speech_tokens in t3_output:
+                    # Add EOS token for proper processing
+                    eos_token = torch.tensor([[eot]], dtype=torch.long, device=self.device)
+                    speech_tokens_with_eos = torch.cat([speech_tokens, eos_token], dim=1)
+
+                    # Convert to audio and yield
+                    wav = speech_to_wav(
+                        speech_tokens_with_eos,
+                        no_trim=True,
+                        trim_start_ms=stream_remove_milliseconds_start,
+                        trim_end_ms=stream_remove_milliseconds_end,
+                    )
+                    yield wav
+
+            # Non-streaming mode (original behavior)
+            else:
+                speech_tokens = self.t3.inference(
+                    t3_cond=self.conds.t3,
+                    text_tokens=text_tokens,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    cfg_weight=cfg_weight,
+                    max_cache_len=max_cache_len,
+                    repetition_penalty=repetition_penalty,
+                    min_p=min_p,
+                    top_p=top_p,
+                    **t3_params,
+                )
+                return speech_to_wav(speech_tokens)
 

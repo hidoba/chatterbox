@@ -353,6 +353,8 @@ class T3(nn.Module):
         stride_length=4,
         skip_when_1=True,
         benchmark_t3=False,
+        # streaming
+        stream_every_n_tokens: Optional[int]=None,
     ):
         """
         Args:
@@ -502,7 +504,7 @@ class T3(nn.Module):
             start = time.time()
             torch.cuda.synchronize() # For benchmarking to have correct it/s
         stride_length = stride_length if "stride" in generate_token_backend else 1
-        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True): 
+        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True):
             i_tensor = indices[i * stride_length]
             # Check for EOS token.
             if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
@@ -542,6 +544,10 @@ class T3(nn.Module):
                 generated_ids = outputs[2].clone()
             output_logits = output_logits.clone()
 
+            # Yield tokens if streaming is enabled
+            if stream_every_n_tokens is not None and (i + 1) * stride_length % stream_every_n_tokens == 0:
+                yield generated_ids.clone()
+
             if i == max_new_tokens // stride_length - 1:
                 if benchmark_t3:
                     torch.cuda.synchronize() # For benchmarking to have correct it/s
@@ -549,7 +555,11 @@ class T3(nn.Module):
                     print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
                     print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
 
-        return generated_ids
+        # Final yield or return
+        if stream_every_n_tokens is not None:
+            yield generated_ids
+        else:
+            return generated_ids
 
 
 def _initial_forward_pass(
