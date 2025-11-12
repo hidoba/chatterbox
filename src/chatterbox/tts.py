@@ -281,13 +281,23 @@ class ChatterboxTTS:
             )
             wav = wav.squeeze(0).detach().cpu().numpy()
 
-            # Apply trimming for streaming chunks
+            # Apply trimming for streaming chunks (with safety checks)
             if trim_end_ms > 0:
-                wav = wav[:-int(self.sr * trim_end_ms / 1000)]
+                trim_samples = int(self.sr * trim_end_ms / 1000)
+                if len(wav) > trim_samples:
+                    wav = wav[:-trim_samples]
             if trim_start_ms > 0:
-                wav = wav[int(self.sr * trim_start_ms / 1000):]
+                trim_samples = int(self.sr * trim_start_ms / 1000)
+                if len(wav) > trim_samples:
+                    wav = wav[trim_samples:]
 
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+            # Skip watermarking if audio is too short (less than 100ms)
+            min_length = int(self.sr * 0.1)  # 100ms minimum
+            if len(wav) >= min_length:
+                watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+            else:
+                # Return unwatermarked audio if too short
+                watermarked_wav = wav
             return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
         # Streaming mode - return a generator
@@ -308,20 +318,31 @@ class ChatterboxTTS:
                         **t3_params,
                     )
 
-                    # Process each chunk of tokens
-                    for speech_tokens in t3_output:
-                        # Add EOS token for proper processing
-                        eos_token = torch.tensor([[eot]], dtype=torch.long, device=self.device)
-                        speech_tokens_with_eos = torch.cat([speech_tokens, eos_token], dim=1)
+                    previous_token_count = 0
 
-                        # Convert to audio and yield
-                        wav = speech_to_wav(
-                            speech_tokens_with_eos,
-                            no_trim=True,
-                            trim_start_ms=stream_remove_milliseconds_start,
-                            trim_end_ms=stream_remove_milliseconds_end,
-                        )
-                        yield wav
+                    # Process each chunk of tokens (accumulated)
+                    for speech_tokens in t3_output:
+                        current_token_count = speech_tokens.shape[1]
+
+                        # Only process NEW tokens since last yield
+                        if current_token_count > previous_token_count:
+                            # Extract only the new tokens
+                            new_tokens = speech_tokens[:, previous_token_count:current_token_count]
+
+                            # Add EOS token for proper processing
+                            eos_token = torch.tensor([[eot]], dtype=torch.long, device=self.device)
+                            new_tokens_with_eos = torch.cat([new_tokens, eos_token], dim=1)
+
+                            # Convert only the NEW tokens to audio
+                            new_wav = speech_to_wav(
+                                new_tokens_with_eos,
+                                no_trim=True,
+                                trim_start_ms=stream_remove_milliseconds_start,
+                                trim_end_ms=stream_remove_milliseconds_end,
+                            )
+
+                            previous_token_count = current_token_count
+                            yield new_wav
 
             return streaming_generator()
 

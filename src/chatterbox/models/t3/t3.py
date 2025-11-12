@@ -508,6 +508,7 @@ class T3(nn.Module):
         # Streaming mode - wrap in a generator
         if stream_every_n_tokens is not None:
             def streaming_generator():
+                nonlocal output_logits, generated_ids
                 for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True):
                     i_tensor = indices[i * stride_length]
                     # Check for EOS token.
@@ -542,13 +543,17 @@ class T3(nn.Module):
                         max_position=max_position,
                         alignment_stream_analyzer=self.patched_model.alignment_stream_analyzer,
                     )
-                    outputs[1]  # output_logits
+                    output_logits = outputs[1]
                     if len(outputs) == 3:
-                        generated_ids[:] = outputs[2]
+                        generated_ids = outputs[2].clone()
+                    output_logits = output_logits.clone()
 
                     # Yield tokens at specified intervals
-                    if (i + 1) * stride_length % stream_every_n_tokens == 0:
-                        yield generated_ids.clone()
+                    tokens_generated = (i + 1) * stride_length
+                    if tokens_generated % stream_every_n_tokens == 0:
+                        # Only yield the tokens generated so far (not the full padded tensor)
+                        actual_tokens = generated_ids[:, :bos_len + tokens_generated]
+                        yield actual_tokens.clone()
 
                     if i == max_new_tokens // stride_length - 1:
                         if benchmark_t3:
@@ -557,8 +562,9 @@ class T3(nn.Module):
                             print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
                             print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
 
-                # Final yield
-                yield generated_ids
+                # Final yield - only return actual generated tokens
+                final_tokens_count = min(max_new_tokens, (i + 1) * stride_length)
+                yield generated_ids[:, :bos_len + final_tokens_count]
 
             return streaming_generator()
 
