@@ -504,61 +504,112 @@ class T3(nn.Module):
             start = time.time()
             torch.cuda.synchronize() # For benchmarking to have correct it/s
         stride_length = stride_length if "stride" in generate_token_backend else 1
-        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True):
-            i_tensor = indices[i * stride_length]
-            # Check for EOS token.
-            if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
-                if (generated_ids == stop_token_tensor).any():
+
+        # Streaming mode - wrap in a generator
+        if stream_every_n_tokens is not None:
+            def streaming_generator():
+                for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True):
+                    i_tensor = indices[i * stride_length]
+                    # Check for EOS token.
+                    if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
+                        if (generated_ids == stop_token_tensor).any():
+                            if benchmark_t3:
+                                torch.cuda.synchronize() # For benchmarking to have correct it/s
+                                print(f"Stopping at {(i + 1) * stride_length} because EOS token was generated")
+                                print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
+                                # it/s
+                                print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
+                            break
+
+                    torch.compiler.cudagraph_mark_step_begin()
+                    bucket_size = 250
+                    max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
+                    outputs = generate_token(
+                        self._speech_embedding_cache,
+                        output_logits,
+                        i_tensor,
+                        batch_idx,
+                        self._speech_pos_embedding_cache,
+                        generated_ids,
+                        cfg_weight,
+                        temperature,
+                        self.repetition_penalty_processor,
+                        self.min_p_warper,
+                        self.top_p_warper,
+                        self.patched_model,
+                        kv_cache,
+                        stride_length,
+                        max_position=max_position,
+                        alignment_stream_analyzer=self.patched_model.alignment_stream_analyzer,
+                    )
+                    outputs[1]  # output_logits
+                    if len(outputs) == 3:
+                        generated_ids[:] = outputs[2]
+
+                    # Yield tokens at specified intervals
+                    if (i + 1) * stride_length % stream_every_n_tokens == 0:
+                        yield generated_ids.clone()
+
+                    if i == max_new_tokens // stride_length - 1:
+                        if benchmark_t3:
+                            torch.cuda.synchronize() # For benchmarking to have correct it/s
+                            print(f"Stopping at {(i + 1) * stride_length} because max_new_tokens reached")
+                            print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
+                            print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
+
+                # Final yield
+                yield generated_ids
+
+            return streaming_generator()
+
+        # Non-streaming mode - return final tensor
+        else:
+            for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True):
+                i_tensor = indices[i * stride_length]
+                # Check for EOS token.
+                if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
+                    if (generated_ids == stop_token_tensor).any():
+                        if benchmark_t3:
+                            torch.cuda.synchronize() # For benchmarking to have correct it/s
+                            print(f"Stopping at {(i + 1) * stride_length} because EOS token was generated")
+                            print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
+                            # it/s
+                            print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
+                        break
+
+                torch.compiler.cudagraph_mark_step_begin()
+                bucket_size = 250
+                max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
+                outputs = generate_token(
+                    self._speech_embedding_cache,
+                    output_logits,
+                    i_tensor,
+                    batch_idx,
+                    self._speech_pos_embedding_cache,
+                    generated_ids,
+                    cfg_weight,
+                    temperature,
+                    self.repetition_penalty_processor,
+                    self.min_p_warper,
+                    self.top_p_warper,
+                    self.patched_model,
+                    kv_cache,
+                    stride_length,
+                    max_position=max_position,
+                    alignment_stream_analyzer=self.patched_model.alignment_stream_analyzer,
+                )
+                output_logits = outputs[1]
+                if len(outputs) == 3:
+                    generated_ids = outputs[2].clone()
+                output_logits = output_logits.clone()
+
+                if i == max_new_tokens // stride_length - 1:
                     if benchmark_t3:
                         torch.cuda.synchronize() # For benchmarking to have correct it/s
-                        print(f"Stopping at {(i + 1) * stride_length} because EOS token was generated")
+                        print(f"Stopping at {(i + 1) * stride_length} because max_new_tokens reached")
                         print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
-                        # it/s
                         print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
-                    break
 
-            # print(kv_cache.get_seq_length().unsqueeze(0))
-            torch.compiler.cudagraph_mark_step_begin()
-            bucket_size = 250
-            max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
-            outputs = generate_token(
-                self._speech_embedding_cache,
-                output_logits,
-                i_tensor,
-                batch_idx,
-                self._speech_pos_embedding_cache,
-                generated_ids,
-                cfg_weight,
-                temperature,
-                self.repetition_penalty_processor,
-                self.min_p_warper,
-                self.top_p_warper,
-                self.patched_model,
-                kv_cache,
-                stride_length,
-                max_position=max_position,
-                alignment_stream_analyzer=self.patched_model.alignment_stream_analyzer,
-            )
-            output_logits = outputs[1]
-            if len(outputs) == 3:
-                generated_ids = outputs[2].clone()
-            output_logits = output_logits.clone()
-
-            # Yield tokens if streaming is enabled
-            if stream_every_n_tokens is not None and (i + 1) * stride_length % stream_every_n_tokens == 0:
-                yield generated_ids.clone()
-
-            if i == max_new_tokens // stride_length - 1:
-                if benchmark_t3:
-                    torch.cuda.synchronize() # For benchmarking to have correct it/s
-                    print(f"Stopping at {(i + 1) * stride_length} because max_new_tokens reached")
-                    print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
-                    print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
-
-        # Final yield or return
-        if stream_every_n_tokens is not None:
-            yield generated_ids
-        else:
             return generated_ids
 
 
