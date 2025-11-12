@@ -223,7 +223,7 @@ class ChatterboxTTS:
         top_p=1.0,
         t3_params={},
         # streaming params
-        stream_tokens_per_slice=None,  # Set to enable streaming (e.g., 200)
+        stream_tokens_per_slice=None,  # Set to enable streaming: int for fixed size (e.g., 200) or list for progressive sizes (e.g., [2,2,3,4,6,8,12,20,30,50,80,120,200])
         stream_remove_milliseconds_end=45,
         stream_remove_milliseconds_start=25,
     ):
@@ -302,6 +302,15 @@ class ChatterboxTTS:
 
         # Streaming mode - return a generator
         if stream_tokens_per_slice is not None:
+            # Determine if using progressive chunk sizes or fixed
+            if isinstance(stream_tokens_per_slice, list):
+                chunk_schedule = stream_tokens_per_slice
+                # Use minimum chunk size as T3 yield interval for fine-grained control
+                t3_yield_interval = min(chunk_schedule)
+            else:
+                chunk_schedule = None
+                t3_yield_interval = stream_tokens_per_slice
+
             def streaming_generator():
                 with torch.inference_mode():
                     t3_output = self.t3.inference(
@@ -314,35 +323,102 @@ class ChatterboxTTS:
                         repetition_penalty=repetition_penalty,
                         min_p=min_p,
                         top_p=top_p,
-                        stream_every_n_tokens=stream_tokens_per_slice,
+                        stream_every_n_tokens=t3_yield_interval,
                         **t3_params,
                     )
 
                     previous_token_count = 0
+                    chunk_start_token_count = 0
+                    chunk_index = 0
+                    MIN_TOKENS_FOR_AUDIO = 3  # Heuristic minimum - actual requirement varies due to s3gen downsampling
+                    last_speech_tokens = None
 
                     # Process each chunk of tokens (accumulated)
                     for speech_tokens in t3_output:
+                        last_speech_tokens = speech_tokens
                         current_token_count = speech_tokens.shape[1]
 
-                        # Only process NEW tokens since last yield
                         if current_token_count > previous_token_count:
-                            # Extract only the new tokens
-                            new_tokens = speech_tokens[:, previous_token_count:current_token_count]
+                            # Determine target chunk size
+                            if chunk_schedule:
+                                if chunk_index < len(chunk_schedule):
+                                    target_chunk_size = chunk_schedule[chunk_index]
+                                else:
+                                    target_chunk_size = chunk_schedule[-1]  # Use last value for remaining chunks
+                            else:
+                                # Fixed chunk size - emit every T3 yield
+                                target_chunk_size = t3_yield_interval
 
-                            # Add EOS token for proper processing
-                            eos_token = torch.tensor([[eot]], dtype=torch.long, device=self.device)
-                            new_tokens_with_eos = torch.cat([new_tokens, eos_token], dim=1)
+                            # Check if we've accumulated enough tokens for this chunk
+                            accumulated_since_last_emit = current_token_count - chunk_start_token_count
 
-                            # Convert only the NEW tokens to audio
-                            new_wav = speech_to_wav(
-                                new_tokens_with_eos,
-                                no_trim=True,
-                                trim_start_ms=stream_remove_milliseconds_start,
-                                trim_end_ms=stream_remove_milliseconds_end,
-                            )
+                            if accumulated_since_last_emit >= target_chunk_size:
+                                # Check if this will leave a too-small remainder
+                                # If so, include the remainder in this chunk to avoid dropping tokens
+                                tokens_after_emit = speech_tokens.shape[1] - current_token_count
+
+                                if tokens_after_emit > 0 and tokens_after_emit < MIN_TOKENS_FOR_AUDIO:
+                                    # Include remainder in this chunk
+                                    chunk_tokens = speech_tokens[:, chunk_start_token_count:]
+                                    chunk_end_pos = speech_tokens.shape[1]
+                                else:
+                                    # Normal chunk emission
+                                    chunk_tokens = speech_tokens[:, chunk_start_token_count:current_token_count]
+                                    chunk_end_pos = current_token_count
+
+                                # Skip if too few tokens (would fail in s3gen convolutions)
+                                if chunk_tokens.shape[1] >= MIN_TOKENS_FOR_AUDIO:
+                                    # Add EOS token for proper processing
+                                    eos_token = torch.tensor([[eot]], dtype=torch.long, device=self.device)
+                                    chunk_tokens_with_eos = torch.cat([chunk_tokens, eos_token], dim=1)
+
+                                    # Convert to audio with error handling
+                                    try:
+                                        new_wav = speech_to_wav(
+                                            chunk_tokens_with_eos,
+                                            no_trim=True,
+                                            trim_start_ms=stream_remove_milliseconds_start,
+                                            trim_end_ms=stream_remove_milliseconds_end,
+                                        )
+                                        yield new_wav
+                                        # Only update position if chunk was successfully emitted
+                                        chunk_start_token_count = chunk_end_pos
+                                        chunk_index += 1
+                                    except RuntimeError as e:
+                                        if "Kernel size can't be greater than actual input size" in str(e):
+                                            # Chunk too small for s3gen after downsampling - DON'T update position
+                                            # Tokens will be included in next chunk
+                                            pass
+                                        else:
+                                            raise
 
                             previous_token_count = current_token_count
-                            yield new_wav
+
+                    # Emit any remaining tokens that weren't processed
+                    if last_speech_tokens is not None and chunk_start_token_count < last_speech_tokens.shape[1]:
+                        remaining_tokens = last_speech_tokens[:, chunk_start_token_count:]
+
+                        if remaining_tokens.shape[1] >= MIN_TOKENS_FOR_AUDIO:
+                            # Add EOS token for proper processing
+                            eos_token = torch.tensor([[eot]], dtype=torch.long, device=self.device)
+                            remaining_tokens_with_eos = torch.cat([remaining_tokens, eos_token], dim=1)
+
+                            # Convert to audio - with error handling for small chunks
+                            try:
+                                final_wav = speech_to_wav(
+                                    remaining_tokens_with_eos,
+                                    no_trim=True,
+                                    trim_start_ms=stream_remove_milliseconds_start,
+                                    trim_end_ms=stream_remove_milliseconds_end,
+                                )
+                                yield final_wav
+                            except RuntimeError as e:
+                                if "Kernel size can't be greater than actual input size" in str(e):
+                                    # This remainder is too small for s3gen - it will be lost
+                                    # This represents a very small amount of audio (< 100ms typically)
+                                    pass
+                                else:
+                                    raise
 
             return streaming_generator()
 

@@ -28,12 +28,16 @@ def main():
     torchaudio.save("output_non_streaming.wav", audio, tts.sr)
     print(f"Saved complete audio to output_non_streaming.wav")
 
-    print("\n=== Streaming Mode ===")
+    print("\n=== Streaming Mode with Progressive Chunk Sizes ===")
     # Streaming: generates audio in chunks
-    # Set stream_tokens_per_slice to enable streaming
-    # Lower values = faster initial response, more chunks
-    # Higher values = fewer chunks, longer initial delay
+    # You can use:
+    # - Fixed chunk size (int): stream_tokens_per_slice=200
+    # - Progressive chunk sizes (list): stream_tokens_per_slice=[2, 2, 3, 4, 6, 8, 12, 20, 30, 50, 80, 120, 200]
+    # Progressive sizes start small for low latency, then increase for efficiency
     import time
+
+    # Define progressive chunk schedule
+    chunk_schedule = [10,10,15,20,40,80,100]
 
     audio_chunks = []
     start_time = time.time()
@@ -44,9 +48,9 @@ def main():
         text=text,
         temperature=0.8,
         cfg_weight=0.5,
-        stream_tokens_per_slice=100,
-        stream_remove_milliseconds_end=45,  # Trim 45ms from end of each chunk
-        stream_remove_milliseconds_start=25,  # Trim 25ms from start of each chunk
+        stream_tokens_per_slice=chunk_schedule,  # Progressive chunk sizes
+        stream_remove_milliseconds_end=35,  # original 45ms
+        stream_remove_milliseconds_start=15,  # original 25ms
     )):
         current_time = time.time()
 
@@ -57,9 +61,12 @@ def main():
         inter_chunk_time = current_time - last_chunk_time
         audio_duration = audio_chunk.shape[1] / tts.sr
 
-        print(f"Received chunk {i+1}: {audio_chunk.shape} | "
+        # Show which chunk size was used (estimate from schedule)
+        chunk_size_used = chunk_schedule[i] if i < len(chunk_schedule) else chunk_schedule[-1]
+
+        print(f"Chunk {i+1} (target: {chunk_size_used} tokens): {audio_chunk.shape} | "
               f"Inter-chunk: {inter_chunk_time:.3f}s | "
-              f"Audio duration: {audio_duration:.3f}s")
+              f"Duration: {audio_duration:.3f}s")
 
         audio_chunks.append(audio_chunk)
         last_chunk_time = current_time
@@ -81,27 +88,6 @@ def main():
     print(f"   Total generation time: {total_time:.3f}s")
     print(f"   Total audio duration: {total_audio_duration:.3f}s")
     print(f"   Real-time factor: {total_audio_duration / total_time:.2f}x")
-
-    print("\n=== Streaming with Different Parameters ===")
-    # Try different chunk sizes
-    for chunk_size in [100, 300, 500]:
-        print(f"\nTesting with chunk_size={chunk_size}")
-        chunk_count = 0
-        start = time.time()
-        first_chunk = None
-
-        for i, _ in enumerate(tts.generate(
-            text=text,
-            stream_tokens_per_slice=chunk_size,
-        )):
-            if i == 0:
-                first_chunk = time.time() - start
-            chunk_count += 1
-
-        total = time.time() - start
-        print(f"  Generated {chunk_count} chunks | "
-              f"First chunk: {first_chunk:.3f}s | "
-              f"Total: {total:.3f}s")
 
 if __name__ == "__main__":
     main()
